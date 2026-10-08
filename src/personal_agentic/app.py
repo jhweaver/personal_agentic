@@ -41,6 +41,7 @@ from .store import Store
 from .tools.base import ToolContext, ToolRegistry
 from .tools.builtin import register_builtin_tools
 from .tools.custom import load_custom_tools
+from .tools.gh import register_gh_tool
 from .working_context import WorkingContext, diff_text
 
 log = logging.getLogger(__name__)
@@ -114,6 +115,8 @@ class AgentApp:
     # ---- lifecycle ----------------------------------------------------------------------------------
     async def start(self, *, scheduler: bool = True, mcp: bool = True) -> None:
         register_builtin_tools(self)
+        if register_gh_tool(self):
+            log.info("GitHub CLI found: the gh tool is available")
         custom = load_custom_tools(self)
         if custom:
             log.info("Loaded custom tools: %s", ", ".join(custom))

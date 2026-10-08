@@ -210,3 +210,50 @@ def test_import_from_claude_code(tmp_path):
 def test_token_path_stays_inside_the_oauth_folder(tmp_path):
     assert token_path(tmp_path, "../../etc/x").parent == tmp_path / "oauth"
     assert token_path(tmp_path, "atlassian").name == "atlassian.json"
+
+
+def test_import_shortens_long_names_and_resolves_them(tmp_path):
+    from personal_agentic.mcp_import import resolve_name, short_name
+
+    assert short_name("atlassian-rovo-mcp-server-remote-0") == "atlassian-rovo"
+    assert short_name("glean-remote-mcp-server-remote-0") == "glean"
+    assert short_name("circleci-mcp-server-npm") == "circleci"
+    claude_json = tmp_path / ".claude.json"
+    claude_json.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "atlassian-rovo-mcp-server-remote-0": {
+                        "type": "http",
+                        "url": "https://mcp.atlassian.com/v1/mcp",
+                    },
+                    "glean-remote-mcp-server-remote-0": {
+                        "type": "http",
+                        "url": "https://acme-be.glean.com/mcp/default",
+                    },
+                    "circleci-mcp-server-npm": {
+                        "command": "npx",
+                        "args": ["-y", "@circleci/mcp-server-circleci"],
+                    },
+                    "glean-mcp": {"type": "http", "url": "https://other/mcp"},
+                }
+            }
+        )
+    )
+    mcp_json = tmp_path / "mcp.json"
+    mcp_json.write_text('{"mcpServers": {}}')
+    dry = import_servers(mcp_json, claude_json=claude_json, dry_run=True)
+    assert sorted(dry.added) == ["atlassian-rovo", "circleci", "glean", "glean-2"]
+    assert json.loads(mcp_json.read_text()) == {"mcpServers": {}}
+
+    res = import_servers(mcp_json, claude_json=claude_json)
+    out = json.loads(mcp_json.read_text())["mcpServers"]
+    assert out["glean"]["claudeName"] in ("glean-mcp", "glean-remote-mcp-server-remote-0")
+    assert resolve_name(out, "atlassian-rovo-mcp-server-remote-0") == "atlassian-rovo"
+    assert resolve_name(out, "circleci") == "circleci"
+    assert resolve_name(out, "nope") is None
+    # importing again updates the same entries instead of adding copies
+    again = import_servers(mcp_json, claude_json=claude_json)
+    assert again.added == [] and sorted(again.kept) == sorted(res.added)
+    keep = import_servers(tmp_path / "k.json", claude_json=claude_json, keep_names=True, dry_run=True)
+    assert "atlassian-rovo-mcp-server-remote-0" in keep.added

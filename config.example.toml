@@ -75,6 +75,7 @@ default_escalation = [
 # Ones that send/post/create/update/delete/... ask you first.
 mcp_default = "auto"
 approval_timeout = "4h"
+# gh = false               # turn off the GitHub CLI tool (on by default when gh is installed)
 # Rules win over everything else, first match wins. Globs match tool names like "slack__post_message".
 # rules = [
 #   { match = "slack__search_*", action = "allow" },

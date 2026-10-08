@@ -24,6 +24,7 @@ class ImportResult:
     kept: list[str] = field(default_factory=list)
     skipped: list[tuple[str, str]] = field(default_factory=list)  # (name, why)
     notes: list[str] = field(default_factory=list)
+    renamed: dict[str, str] = field(default_factory=dict)  # Claude Code name -> name here
     servers: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
@@ -107,6 +108,31 @@ def needs_sign_in(entry: dict[str, Any]) -> bool:
     return "authorization" not in headers and not entry.get("headersHelper")
 
 
+# Words that say nothing about which service a server is, dropped from imported names so the
+# agent's tool names stay short ("atlassian-rovo-mcp-server-remote-0" -> "atlassian-rovo").
+_NOISE = {
+    "mcp",
+    "server",
+    "servers",
+    "remote",
+    "npm",
+    "npx",
+    "pypi",
+    "uvx",
+    "docker",
+    "local",
+    "stdio",
+    "http",
+    "sse",
+}
+
+
+def short_name(name: str) -> str:
+    tokens = [t for t in re.split(r"[^A-Za-z0-9]+", name.lower()) if t]
+    kept = [t for t in tokens if t not in _NOISE and not t.isdigit()]
+    return "-".join(kept) or re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-") or "server"
+
+
 def import_servers(
     mcp_json: Path,
     claude_json: Path | None = None,
@@ -114,6 +140,7 @@ def import_servers(
     include_local: bool = True,
     overwrite: bool = False,
     dry_run: bool = False,
+    keep_names: bool = False,
 ) -> ImportResult:
     res = ImportResult()
     found, res.notes = collect_claude_servers(
@@ -123,18 +150,42 @@ def import_servers(
     if mcp_json.exists():
         existing = json.loads(mcp_json.read_text() or "{}")
     servers: dict[str, Any] = dict(existing.get("mcpServers") or {})
+    by_claude_name = {
+        e.get("claudeName"): n for n, e in servers.items() if isinstance(e, dict) and e.get("claudeName")
+    }
+    taken: set[str] = set()
     for name, cfg in sorted(found.items()):
         entry, why = convert(name, cfg)
         if entry is None:
             res.skipped.append((name, why or "unsupported"))
             continue
-        if name in servers and not overwrite:
-            res.kept.append(name)
+        # Same server imported before (possibly under its short name): update that entry.
+        target = by_claude_name.get(name) or (name if keep_names or name in servers else short_name(name))
+        if target not in by_claude_name.values() and target != name:
+            base, n = target, 2
+            while target in taken or (target in servers and servers[target].get("claudeName") != name):
+                target, n = f"{base}-{n}", n + 1
+        taken.add(target)
+        if target != name:
+            entry["claudeName"] = name
+            res.renamed[name] = target
+        if target in servers and not overwrite:
+            res.kept.append(target)
             continue
-        (res.replaced if name in servers else res.added).append(name)
-        servers[name] = entry
+        (res.replaced if target in servers else res.added).append(target)
+        servers[target] = entry
     res.servers = servers
     if not dry_run and (res.added or res.replaced):
         existing["mcpServers"] = servers
         mcp_json.write_text(json.dumps(existing, indent=2) + "\n")
     return res
+
+
+def resolve_name(servers: dict[str, Any], name: str) -> str | None:
+    """A server's name in mcp.json, also accepting the name it had in Claude Code."""
+    if name in servers:
+        return name
+    for key, entry in servers.items():
+        if isinstance(entry, dict) and entry.get("claudeName") == name:
+            return key
+    return None

@@ -170,6 +170,8 @@ class ToolsConfig(BaseModel):
     mcp_default: Literal["auto", "allow", "ask"] = "auto"
     rules: list[PolicyRule] = Field(default_factory=list)
     approval_timeout: str = "4h"
+    # The `gh` tool (GitHub CLI with your own login). None = on when gh is installed.
+    gh: bool | None = None
 
 
 class ServerConfig(BaseModel):

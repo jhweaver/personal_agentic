@@ -174,7 +174,9 @@ pa mcp import --project ~/some/repo   # also that folder's .mcp.json
 ```
 
 This copies the server definitions into `mcp.json` and keeps any entry you already have
-there (`--overwrite` replaces them). Logins don't carry over: Claude Code's tokens live in its
+there (`--overwrite` replaces them). Long names get shortened so tool names stay readable, for
+example `atlassian-rovo-mcp-server-remote-0` becomes `atlassian-rovo` (`--keep-names` turns
+this off). The original names still work with `pa mcp login`. Logins don't carry over: Claude Code's tokens live in its
 keychain entries and were issued to its own app. So the import lists the servers to sign in to.
 
 ### Sign in
@@ -219,8 +221,23 @@ Any `http` or `sse` server without an `Authorization` header uses sign-in.
 |---|---|
 | Atlassian | Sign in. Or, if your admin allows API tokens: `"url": "https://mcp.atlassian.com/v2/mcp"` with `"headers": {"Authorization": "Basic ${ATLASSIAN_BASIC}"}` (base64 of `email:token`). Code search and Teams tools need sign-in. |
 | Glean | Sign in, with the server URL from Glean's MCP Configurator (it's specific to your company). |
-| Slack | Needs an internal Slack app in your workspace (Slack only allows directory-listed or internal apps, and admins approve them). Then sign in with its client ID and secret, or put a user token from that app in an `Authorization: Bearer` header. |
+| Slack | Needs an internal Slack app in your workspace (Slack only allows directory-listed or internal apps, and admins approve them). Then sign in with its client ID and secret, or put a user token from that app in an `Authorization: Bearer` header. Until then, if your Glean includes Slack, Glean search covers reading it. |
+| GitHub | Uses the built-in `gh` tool (your GitHub CLI login), so no GitHub MCP server is needed. See below. |
 | Google | Claude's built-in Gmail/Calendar/Drive connectors run through Anthropic, so the agent can't use them. Google's own Workspace MCP servers (e.g. `https://gmailmcp.googleapis.com/mcp/v1`) are a developer preview: you need to be enrolled, create an OAuth client in a Google Cloud project with the `http://localhost:33418/callback` redirect, and enable the APIs. Then sign in with that client ID and secret. |
+
+### GitHub through `gh`
+
+If the GitHub CLI is installed and signed in (`gh auth status`), the agent gets a `gh` tool,
+the way you'd ask Claude Code to use `gh`. It runs `gh` directly (no shell) with your own login:
+
+- **Runs freely:** reads, such as `pr list`, `pr view`, `search prs`, `run view`, and
+  `gh api` GET requests.
+- **Asks you first:** anything that could change GitHub, such as creating, commenting, merging,
+  closing, reviewing, or `gh api` with POST/PATCH/DELETE.
+- **Refused:** commands that touch credentials or local files (`auth`, `secret`, `repo clone`,
+  `pr checkout`, ...).
+
+`pa check` shows whether `gh` is signed in. To turn the tool off, set `[tools] gh = false`.
 
 ### Everything else
 

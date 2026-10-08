@@ -72,9 +72,15 @@ def cmd_init(args: argparse.Namespace) -> None:
     root = Path.cwd()
     copies = [
         ("config.example.toml", "config.toml"),
-        ("mcp.example.json", "mcp.json"),
         (".env.example", ".env"),
     ]
+    mcp_json = root / "mcp.json"
+    if mcp_json.exists():
+        print("  exists   mcp.json")
+    else:
+        # Start empty; mcp.example.json shows the format. `pa mcp import` fills it from Claude Code.
+        mcp_json.write_text('{\n  "mcpServers": {}\n}\n')
+        print("  created  mcp.json (empty: run `pa mcp import` to bring over Claude Code's servers)")
     for src, dst in copies:
         s, d = root / src, root / dst
         if d.exists():
@@ -169,6 +175,21 @@ async def _check(cfg, skip_mcp: bool) -> None:
         line(False, "LM Studio", str(e))
     finally:
         await llm.aclose()
+
+    gh = shutil.which("gh")
+    if cfg.tools.gh is False:
+        line(None, "GitHub CLI", "turned off in config ([tools] gh = false)")
+    elif not gh:
+        line(None, "GitHub CLI", "gh not found on PATH (install with `brew install gh` to use GitHub)")
+    else:
+        proc = await asyncio.create_subprocess_exec(
+            gh, "auth", "status", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        )
+        out, _ = await proc.communicate()
+        first = next(
+            (ln.strip() for ln in out.decode(errors="replace").splitlines() if "Logged in" in ln), ""
+        )
+        line(proc.returncode == 0, "GitHub CLI", first or "not logged in: run `gh auth login`")
 
     emb = Embedder(cfg.embeddings, cfg.llm.base_url, cfg.llm.api_key)
     for space in emb.available_spaces():
@@ -427,16 +448,28 @@ def cmd_mcp(args: argparse.Namespace) -> None:
         return
     if not args.name:
         _die(f"Usage: pa mcp {args.action} NAME")
-    if args.name not in servers:
-        _die(f"No server named {args.name!r} in {mcp_path}. Have: {', '.join(servers) or 'none'}")
+    from .mcp_import import claude_config_path, collect_claude_servers, resolve_name
+
+    name = resolve_name(servers, args.name)
+    if name is None:
+        msg = f"No server named {args.name!r} in {mcp_path}. Have: {', '.join(servers) or 'none'}."
+        try:
+            in_claude, _ = collect_claude_servers(claude_config_path())
+        except (OSError, ValueError):
+            in_claude = {}
+        if args.name in in_claude:
+            msg += "\nIt's set up in Claude Code but not imported yet: run `pa mcp import` first."
+        _die(msg)
+    if name != args.name:
+        print(f"({args.name} is called {name} here.)")
     if args.action == "login":
-        _mcp_login(args, cfg, args.name, servers[args.name])
+        _mcp_login(args, cfg, name, servers[name])
     elif args.action == "logout":
         from .oauth import FileTokenStorage, token_path
 
-        removed = FileTokenStorage(token_path(cfg.data_dir, args.name)).clear()
-        print(f"Signed out of {args.name}." if removed else f"{args.name} had no saved sign-in.")
-        _try_server(args, "POST", f"/api/mcp/{args.name}/restart")
+        removed = FileTokenStorage(token_path(cfg.data_dir, name)).clear()
+        print(f"Signed out of {name}." if removed else f"{name} had no saved sign-in.")
+        _try_server(args, "POST", f"/api/mcp/{name}/restart")
 
 
 def _mcp_login(args: argparse.Namespace, cfg: Any, name: str, server_cfg: dict[str, Any]) -> None:
@@ -501,11 +534,23 @@ def _mcp_import(args: argparse.Namespace, mcp_path: Path) -> None:
         include_local=not args.user_only,
         overwrite=args.overwrite,
         dry_run=args.dry_run,
+        keep_names=args.keep_names,
     )
+    claude_name = {v: k for k, v in res.renamed.items()}
+
+    def label(n: str) -> str:
+        return f"{n} (from {claude_name[n]})" if n in claude_name else n
+
     verb = "Would add" if args.dry_run else "Added"
-    for label, names in ((verb, res.added), ("Replaced", res.replaced), ("Kept existing", res.kept)):
+    for title, names in (
+        (verb, res.added),
+        ("Replaced" if not args.dry_run else "Would replace", res.replaced),
+        ("Already in mcp.json", res.kept),
+    ):
         if names:
-            print(f"{label}: {', '.join(names)}")
+            print(f"{title}:")
+            for n in names:
+                print(f"  {label(n)}")
     for name, why in res.skipped:
         print(f"Skipped {name}: {why}")
     for note in res.notes:
@@ -513,19 +558,26 @@ def _mcp_import(args: argparse.Namespace, mcp_path: Path) -> None:
     if not (res.added or res.replaced or res.kept or res.skipped):
         print(f"No MCP servers found in {source}.")
         return
-    to_login = [n for n in res.added + res.replaced if needs_sign_in(res.servers[n])]
+    changed = res.added + res.replaced
+    to_login = [n for n in changed if needs_sign_in(res.servers[n])]
+    with_client = [n for n in changed if (res.servers[n].get("oauth") or {}).get("clientId")]
+    if args.dry_run:
+        if changed:
+            print("\nNothing was written. Run `pa mcp import` without --dry-run to add them.")
+        return
+    if changed:
+        print(f"\nWrote {mcp_path}.")
     if to_login:
-        print("\nSign in to these once (Claude Code's logins can't be reused):")
+        print("\nNext, sign in to each of these once (Claude Code's logins can't be reused):")
         for n in to_login:
             print(f"  pa mcp login {n}")
-    with_client = [n for n in res.added + res.replaced if (res.servers[n].get("oauth") or {}).get("clientId")]
     if with_client:
         print(
             "\nThese use their own OAuth app. If it needs a client secret, put it in .env as shown in mcp.json: "
             + ", ".join(with_client)
         )
-    if not args.dry_run and (res.added or res.replaced):
-        print(f"\nWrote {mcp_path}. Restart the agent's MCP servers (System tab) or run `pa serve` again.")
+    if changed:
+        print("\nIf the agent is running, restart its MCP servers from the System tab.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -598,6 +650,9 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--user-only", action="store_true", help="import: only Claude Code's user-scoped servers")
     m.add_argument("--project", action="append", default=[], help="import: also read DIR/.mcp.json")
     m.add_argument("--claude-config", help="import: path to Claude Code's .claude.json")
+    m.add_argument(
+        "--keep-names", action="store_true", help="import: keep Claude Code's server names as they are"
+    )
     m.set_defaults(fn=cmd_mcp)
     return p
 
