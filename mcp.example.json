@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "example-stdio": {
+      "disabled": true,
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"],
+      "env": {}
+    },
+    "example-http": {
+      "disabled": true,
+      "type": "http",
+      "url": "https://mcp.example.internal/mcp",
+      "headers": { "Authorization": "Bearer ${EXAMPLE_TOKEN}" },
+      "exclude_tools": ["delete_*"],
+      "policy": { "search_*": "allow", "send_*": "ask" },
+      "timeout": 120
+    }
+  }
+}

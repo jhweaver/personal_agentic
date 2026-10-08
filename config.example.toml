@@ -1,0 +1,96 @@
+# Copy to config.toml (`pa init` does this). Every setting has a default; change what you need.
+# Relative paths are relative to this file.
+
+[agent]
+user_name = "Harper"
+max_steps = 40                 # tool-call rounds per turn before it has to wrap up
+subagent_max_steps = 30
+
+[llm]
+base_url = "http://localhost:1234/v1"   # LM Studio's OpenAI-compatible server
+model = "qwen/qwen3.8-27b"              # exact id from `pa check` or LM Studio's model list
+# context_window = 262144               # leave unset to read it from LM Studio
+max_output_tokens = 16384
+max_parallel = 1                        # requests to LM Studio at once; chat jumps the queue
+# How thinking is switched per request. If `pa check` shows no reasoning with thinking on, or
+# thinking that won't turn off, try "reasoning_effort", "both" or "none".
+thinking_control = "chat_template_kwargs"
+# reasoning_effort = "medium"
+
+# Sampling presets for thinking on / off. Extra keys pass straight through to LM Studio.
+[llm.sampling_thinking]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+presence_penalty = 0.0
+
+[llm.sampling_fast]
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+
+[thinking]
+chat = false          # your messages (toggle with /think and /fast)
+routines = true       # scheduled routines (each can override with `thinking:`)
+subagents = true
+compaction = false
+
+[embeddings.text]
+model = "text-embedding-nomic-embed-text-v1.5"   # check the exact id in LM Studio
+query_prefix = "search_query: "
+document_prefix = "search_document: "
+
+[embeddings.code]
+model = "nomic-embed-code"
+query_prefix = "Represent this query for searching relevant code: "
+document_prefix = ""
+
+[context]
+compact_at_tokens = 100000   # summarize older conversation past this (long prompts are slow on a Mac)
+keep_recent_tokens = 24000   # recent conversation kept word for word after summarizing
+max_tool_result_chars = 40000
+
+[workday]
+timezone = "America/Chicago"
+days = ["mon", "tue", "wed", "thu", "fri"]
+start = "08:00"
+end = "17:30"
+holidays = []                # e.g. [2026-11-26, 2026-12-25]
+
+[notify]
+desktop = true
+imessage_self = ""           # your phone number or Apple ID email, for iMessages to yourself
+escalate_outside_workday = false
+# When something waits on you: shown on the web page, then these reminders.
+default_escalation = [
+  { after = "20m", via = "desktop" },
+  { after = "90m", via = "imessage" },
+]
+
+[tools]
+# "auto": MCP tools marked read-only, or whose names don't suggest changing anything, run freely.
+# Ones that send/post/create/update/delete/... ask you first.
+mcp_default = "auto"
+approval_timeout = "4h"
+# Rules win over everything else, first match wins. Globs match tool names like "slack__post_message".
+# rules = [
+#   { match = "slack__search_*", action = "allow" },
+#   { match = "gmail__send_*", action = "ask" },
+#   { match = "*__delete_*", action = "deny" },
+# ]
+
+[server]
+host = "127.0.0.1"
+port = 8765
+
+[paths]
+data_dir = "~/.personal_agentic"
+working_context = "~/.personal_agentic/working_context.md"
+routines_dir = "routines"
+tasks_dir = "tasks"
+tools_dir = "tools"
+mcp_config = "mcp.json"
+system_prompt = "prompts/system.md"

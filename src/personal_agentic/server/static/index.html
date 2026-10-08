@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='4' y='6' width='24' height='20' rx='3' fill='%231F5F7A'/%3E%3Crect x='9' y='12' width='14' height='2.5' rx='1' fill='%23F5C518'/%3E%3Crect x='9' y='17' width='9' height='2.5' rx='1' fill='%23EDF0F3'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="top">
+    <div class="who">
+      <h1 id="agent-name">Agent</h1>
+      <span class="state" id="state"><span class="dot"></span><span id="state-text">connecting</span></span>
+    </div>
+    <div class="meter" id="meter" title="How full the conversation is. It's summarized automatically at the marker.">
+      <div class="meter-bar"><div class="meter-fill" id="meter-fill"></div><div class="meter-mark" id="meter-mark"></div></div>
+      <span class="meter-text" id="meter-text">context —</span>
+    </div>
+    <div class="model" id="model"></div>
+  </header>
+
+  <nav class="mobile-tabs" aria-label="Views">
+    <button data-view="feed" class="on">Conversation</button>
+    <button data-view="side">Waiting <span class="count" id="m-count"></span></button>
+  </nav>
+
+  <main class="layout">
+    <section class="feed-wrap" data-pane="feed">
+      <div class="feed" id="feed" aria-live="polite">
+        <button class="earlier" id="earlier" hidden>Load earlier</button>
+      </div>
+      <form class="composer" id="composer">
+        <textarea id="input" rows="1" placeholder="Message the agent" title="Enter sends. Shift+Enter adds a new line." autocomplete="off"></textarea>
+        <div class="composer-actions">
+          <label class="think" title="Let the model reason before answering. Slower, better for planning.">
+            <input type="checkbox" id="think"> Think
+          </label>
+          <button type="button" class="ghost" id="stop" hidden>Stop</button>
+          <button type="submit" class="send" id="send">Send</button>
+        </div>
+      </form>
+    </section>
+
+    <aside class="side" data-pane="side">
+      <section class="waiting" id="waiting-section" aria-labelledby="waiting-h">
+        <h2 id="waiting-h">Waiting on you</h2>
+        <div id="waiting"><p class="quiet">Nothing right now.</p></div>
+      </section>
+
+      <div class="tabs" role="tablist">
+        <button role="tab" data-tab="wc" class="on">Working context</button>
+        <button role="tab" data-tab="activity">Activity</button>
+        <button role="tab" data-tab="routines">Routines</button>
+        <button role="tab" data-tab="system">System</button>
+      </div>
+
+      <section class="tab-pane on" data-pane-tab="wc">
+        <div class="wc-head">
+          <span class="quiet small" id="wc-path"></span>
+          <button class="ghost small" id="wc-edit">Edit</button>
+        </div>
+        <div class="md wc" id="wc-view"></div>
+        <form id="wc-form" hidden>
+          <textarea id="wc-text" spellcheck="false"></textarea>
+          <div class="row">
+            <button type="button" class="ghost" id="wc-cancel">Cancel</button>
+            <button type="submit" class="send">Save</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="tab-pane" data-pane-tab="activity">
+        <p class="quiet small">Sub-agents and routine runs. Select one to read its transcript.</p>
+        <ul class="activity" id="activity"></ul>
+      </section>
+
+      <section class="tab-pane" data-pane-tab="routines">
+        <ul class="routines" id="routines"></ul>
+      </section>
+
+      <section class="tab-pane" data-pane-tab="system">
+        <dl class="sys" id="sys"></dl>
+      </section>
+    </aside>
+  </main>
+
+  <dialog id="transcript">
+    <div class="dlg-head">
+      <h2 id="tr-title">Transcript</h2>
+      <div>
+        <button class="ghost small" id="tr-cancel" hidden>Cancel run</button>
+        <button class="ghost small" id="tr-close">Close</button>
+      </div>
+    </div>
+    <div class="feed" id="tr-feed"></div>
+  </dialog>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

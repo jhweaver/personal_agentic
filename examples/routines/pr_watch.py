@@ -1,0 +1,65 @@
+"""The PR watch as a Python routine: code does the filtering, the model only checks Slack.
+
+Copy this into routines/ to use it instead of routines/pr-watch.md (disable one of them).
+Check the GitHub tool name and arguments against your GitHub MCP server first: run
+`pa tools` to list them.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta
+
+from personal_agentic import RoutineContext, routine
+
+REPO = "your-org/X"
+AUTHORS = ["h1", "h2", "h3"]
+MIN_OPEN = timedelta(hours=3)
+
+
+@routine(
+    every="15m",
+    window="workday",
+    report="changes",
+    notify=["desktop"],
+    enabled=False,
+    description="PRs from watched authors open 3h+ with no Slack mention go on the plate (Python version).",
+)
+async def pr_watch_py(ctx: RoutineContext) -> str:
+    handled: list[int] = ctx.state.get("handled", [])
+    added: list[str] = []
+    still_open: set[int] = set()
+
+    for author in AUTHORS:
+        # Adjust to your GitHub MCP server's search tool and its argument names.
+        raw = await ctx.call_tool(
+            "github__search_pull_requests",
+            {"query": f"repo:{REPO} is:pr is:open author:{author}"},
+        )
+        try:
+            items = json.loads(raw).get("items", [])
+        except (json.JSONDecodeError, AttributeError):
+            ctx.emit(f"Couldn't parse GitHub results for {author}: {raw[:200]}")
+            continue
+        for pr in items:
+            number = pr["number"]
+            still_open.add(number)
+            created = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00"))
+            if number in handled or ctx.now() - created < MIN_OPEN:
+                continue
+            verdict = await ctx.ask(
+                f"Search Slack for any mention of pull request {REPO}#{number} "
+                f'(URL {pr["html_url"]}, title "{pr["title"]}"). '
+                "Reply with exactly MENTIONED or NOT_MENTIONED, then one line of evidence.",
+                tools=["slack__*"],
+                thinking=False,
+                title=f"slack check #{number}",
+            )
+            if verdict.strip().upper().startswith("NOT_MENTIONED"):
+                line = f'- [ ] Review PR #{number} "{pr["title"]}" by @{author} — {pr["html_url"]} (pr-watch, {ctx.now():%Y-%m-%d})'
+                await ctx.working_context.update("Plate", "append", line)
+                added.append(line)
+            handled.append(number)
+
+    ctx.state["handled"] = [n for n in handled if n in still_open]
+    return "\n".join(added) if added else "NO_UPDATE"
