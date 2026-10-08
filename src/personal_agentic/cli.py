@@ -23,6 +23,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -219,7 +220,10 @@ def cmd_serve(args: argparse.Namespace) -> None:
             logging.FileHandler(log_dir / "agent.log"),
         ],
     )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    for noisy in ("httpx", "httpx2", "mcp.client.streamable_http"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+    # Sign-in problems show up as server status ("needs sign-in"); skip the SDK's tracebacks.
+    logging.getLogger("mcp.client.auth").setLevel(logging.CRITICAL)
     print(f"Agent web page: {cfg.server_url}   (terminal: `pa chat`)")
     if args.open:
         import webbrowser
@@ -398,6 +402,132 @@ def cmd_wc(args: argparse.Namespace) -> None:
     print(_server_call(args, "GET", "/api/working-context")["content"])
 
 
+# ---- pa mcp ---------------------------------------------------------------------------------------
+def _try_server(args: argparse.Namespace, method: str, path: str) -> Any:
+    """Call the running agent if there is one; None if it isn't running."""
+    try:
+        with _http(args, timeout=60) as http:
+            r = http.request(method, path)
+            return r.json() if r.status_code < 400 else None
+    except httpx.HTTPError:
+        return None
+
+
+def cmd_mcp(args: argparse.Namespace) -> None:
+    from .mcp_servers import load_mcp_config
+
+    cfg = _cfg(args)
+    mcp_path = cfg.resolve(cfg.paths.mcp_config)
+    if args.action == "import":
+        _mcp_import(args, mcp_path)
+        return
+    servers = load_mcp_config(mcp_path)
+    if args.action == "list":
+        _mcp_list(args, cfg, servers)
+        return
+    if not args.name:
+        _die(f"Usage: pa mcp {args.action} NAME")
+    if args.name not in servers:
+        _die(f"No server named {args.name!r} in {mcp_path}. Have: {', '.join(servers) or 'none'}")
+    if args.action == "login":
+        _mcp_login(args, cfg, args.name, servers[args.name])
+    elif args.action == "logout":
+        from .oauth import FileTokenStorage, token_path
+
+        removed = FileTokenStorage(token_path(cfg.data_dir, args.name)).clear()
+        print(f"Signed out of {args.name}." if removed else f"{args.name} had no saved sign-in.")
+        _try_server(args, "POST", f"/api/mcp/{args.name}/restart")
+
+
+def _mcp_login(args: argparse.Namespace, cfg: Any, name: str, server_cfg: dict[str, Any]) -> None:
+    from .mcp_servers import sign_in
+    from .oauth import default_open_browser, oauth_settings
+
+    async def open_browser(url: str) -> None:
+        print(f"Opening your browser to sign in to {name}. If it doesn't open, go to:\n  {url}\n")
+        await default_open_browser(url)
+
+    port = oauth_settings(server_cfg).callback_port
+    print(f"Waiting for the sign-in to finish (listening on http://localhost:{port}/callback)...")
+    try:
+        count = asyncio.run(sign_in(name, server_cfg, cfg.data_dir, open_browser, timeout=args.timeout))
+    except Exception as e:  # show the useful part of whatever went wrong
+        from .mcp_servers import _describe
+
+        _die(f"Sign-in to {name} failed: {_describe(e)}")
+    print(f"Signed in to {name}: {count} tools available.")
+    if _try_server(args, "POST", f"/api/mcp/{name}/restart") is not None:
+        print("The running agent reconnected to it.")
+
+
+def _mcp_list(args: argparse.Namespace, cfg: Any, servers: dict[str, dict[str, Any]]) -> None:
+    from .mcp_servers import server_kind
+    from .oauth import FileTokenStorage, token_path, uses_oauth
+
+    if not servers:
+        print(f"No MCP servers in {cfg.resolve(cfg.paths.mcp_config)}. Try `pa mcp import`.")
+        return
+    live = {m["name"]: m for m in (_try_server(args, "GET", "/api/mcp") or [])}
+    for name, sc in servers.items():
+        kind = server_kind(sc)
+        where = sc.get("url") or " ".join([sc.get("command", ""), *map(str, sc.get("args", []))])
+        if sc.get("disabled"):
+            state = "disabled"
+        elif kind == "stdio":
+            state = "local command"
+        elif uses_oauth(sc):
+            info = FileTokenStorage(token_path(cfg.data_dir, name)).summary()
+            state = "signed in" if info["signed_in"] else "not signed in (pa mcp login " + name + ")"
+        else:
+            state = "token in headers"
+        line = f"{name:16} {kind:6} {state}"
+        if name in live:
+            m = live[name]
+            line += f" | agent: {m['status']}" + (
+                f", {m['tools']} tools" if m["status"] == "connected" else ""
+            )
+        print(line)
+        print(f"{'':16} {where}")
+
+
+def _mcp_import(args: argparse.Namespace, mcp_path: Path) -> None:
+    from .mcp_import import claude_config_path, import_servers, needs_sign_in
+
+    source = Path(args.claude_config).expanduser() if args.claude_config else claude_config_path()
+    res = import_servers(
+        mcp_path,
+        claude_json=source,
+        project_dirs=[Path(p) for p in args.project],
+        include_local=not args.user_only,
+        overwrite=args.overwrite,
+        dry_run=args.dry_run,
+    )
+    verb = "Would add" if args.dry_run else "Added"
+    for label, names in ((verb, res.added), ("Replaced", res.replaced), ("Kept existing", res.kept)):
+        if names:
+            print(f"{label}: {', '.join(names)}")
+    for name, why in res.skipped:
+        print(f"Skipped {name}: {why}")
+    for note in res.notes:
+        print(f"Note: {note}")
+    if not (res.added or res.replaced or res.kept or res.skipped):
+        print(f"No MCP servers found in {source}.")
+        return
+    to_login = [n for n in res.added + res.replaced if needs_sign_in(res.servers[n])]
+    if to_login:
+        print("\nSign in to these once (Claude Code's logins can't be reused):")
+        for n in to_login:
+            print(f"  pa mcp login {n}")
+    with_client = [n for n in res.added + res.replaced if (res.servers[n].get("oauth") or {}).get("clientId")]
+    if with_client:
+        print(
+            "\nThese use their own OAuth app. If it needs a client secret, put it in .env as shown in mcp.json: "
+            + ", ".join(with_client)
+        )
+    if not args.dry_run and (res.added or res.replaced):
+        print(f"\nWrote {mcp_path}. Restart the agent's MCP servers (System tab) or run `pa serve` again.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="pa", description="Personal work agent")
     p.add_argument("--config", help="path to config.toml")
@@ -458,6 +588,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("tools", help="list the agent's tools").set_defaults(fn=cmd_tools)
     sub.add_parser("wc", help="print the working context").set_defaults(fn=cmd_wc)
+
+    m = sub.add_parser("mcp", help="MCP servers: list, login, logout, import from Claude Code")
+    m.add_argument("action", choices=["list", "login", "logout", "import"])
+    m.add_argument("name", nargs="?")
+    m.add_argument("--timeout", type=float, default=300, help="login: seconds to wait for the browser")
+    m.add_argument("--dry-run", action="store_true", help="import: show what would change")
+    m.add_argument("--overwrite", action="store_true", help="import: replace servers already in mcp.json")
+    m.add_argument("--user-only", action="store_true", help="import: only Claude Code's user-scoped servers")
+    m.add_argument("--project", action="append", default=[], help="import: also read DIR/.mcp.json")
+    m.add_argument("--claude-config", help="import: path to Claude Code's .claude.json")
+    m.set_defaults(fn=cmd_mcp)
     return p
 
 

@@ -300,7 +300,11 @@ class Feed {
   }
   on_escalated(ev, d) { this.entry(ev, "sys", `Reminder sent by ${d.via}: ${d.title}`); }
   on_agent_started(ev, d) { this.turn = null; this.entry(ev, "sys", `Agent started with ${d.tools} tools and ${d.routines} routines/tasks.`); }
-  on_mcp_status(ev, d) { if (d.status === "error") this.entry(ev, "err", `MCP server ${d.server}: ${d.error}`); }
+  on_mcp_status(ev, d) {
+    if (d.status === "error") this.entry(ev, "err", `MCP server ${d.server}: ${d.error}`);
+    else if (d.status === "needs_login") this.entry(ev, "notice", `${d.server} needs you to sign in: System tab, or \`pa mcp login ${d.server}\`.`);
+    else if (d.status === "signed_in") this.entry(ev, "sys", `Signed in to ${d.server}.`);
+  }
 }
 
 function approvalActions(id) {
@@ -470,11 +474,40 @@ const app = {
     row("Thinking", st.thinking ? "On for chat (/fast turns it off)" : "Off for chat (/think turns it on)");
     row("Tools", String(st.tools));
     if (!st.mcp.length) row("MCP", "No servers configured. Add them to mcp.json.");
-    for (const m of st.mcp) row(m.name, m.status === "connected" ? `connected, ${m.tools} tools` : `${m.status}: ${m.error || ""}`, m.status === "connected" ? "" : "err");
+    for (const m of st.mcp) {
+      const ok = m.status === "connected";
+      const text = ok ? `connected, ${m.tools} tools` : m.status === "needs_login" ? "needs sign-in" : `${m.status}: ${m.error || ""}`;
+      const dd = h("dd", { class: ok ? "" : "err" }, text);
+      if (m.auth === "oauth") {
+        dd.append(" ", ok
+          ? h("button", { class: "ghost small", type: "button", onclick: () => this.mcpLogout(m.name) }, "Sign out")
+          : h("button", { class: "send small", type: "button", onclick: () => this.mcpLogin(m.name) }, "Sign in"));
+      }
+      dl.append(h("dt", {}, m.name), dd);
+    }
     row("Up for", `${Math.round(st.uptime_s / 60)} min`);
     dl.append(h("dt"), h("dd", {},
       h("button", { class: "ghost small", onclick: async (e) => { e.target.disabled = true; await this.api("/api/mcp/reload", { method: "POST" }).catch(() => {}); e.target.disabled = false; this.refreshStatus(); } }, "Restart MCP servers"), " ",
       h("button", { class: "ghost small", onclick: async () => { await this.api("/api/routines/reload", { method: "POST" }); this.loadRoutines(); } }, "Reload routines")));
+  },
+
+  async mcpLogin(name) {
+    // Open the tab now, while we still have the click: browsers block pop-ups opened later.
+    const tab = window.open("about:blank", "_blank");
+    try {
+      const res = await this.api(`/api/mcp/${encodeURIComponent(name)}/login`, { method: "POST" });
+      if (res.url && tab) tab.location = res.url;
+      else if (res.url) window.open(res.url, "_blank");
+      else if (tab) tab.close();
+    } catch (err) {
+      if (tab) tab.close();
+      this.feed.add({ kind: "error", ts: Date.now() / 1000, source: "system", data: { text: String(err.message || err) } });
+    }
+  },
+
+  async mcpLogout(name) {
+    await this.api(`/api/mcp/${encodeURIComponent(name)}/logout`, { method: "POST" }).catch(() => {});
+    this.refreshStatus();
   },
 
   async loadWaiting() {

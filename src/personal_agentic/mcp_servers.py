@@ -17,8 +17,11 @@ Extra keys this agent understands, per server:
     "policy": {"send_*": "ask", "*": "allow"}   approval rules on the server's own tool names
     "timeout": 120                   seconds per tool call
 
-Each server's tools appear to the model as "<server>__<tool>". Servers that need an OAuth
-browser sign-in aren't supported directly; see the README for bridging them over stdio.
+    "oauth": {...}                   sign-in settings (see oauth.py); same keys as Claude Code
+    "headersHelper": "cmd"           shell command printing a JSON object of extra headers
+
+Each server's tools appear to the model as "<server>__<tool>". HTTP servers without an
+Authorization header sign in with OAuth: run `pa mcp login <server>` once.
 """
 
 from __future__ import annotations
@@ -35,6 +38,18 @@ from typing import TYPE_CHECKING, Any, TextIO
 
 from mcp import Client, StdioServerParameters
 
+from .oauth import (
+    CallbackServer,
+    FileTokenStorage,
+    LoginRequired,
+    OpenBrowser,
+    background_provider,
+    find_exception,
+    interactive_provider,
+    oauth_settings,
+    token_path,
+    uses_oauth,
+)
 from .tools.base import ToolContext, ToolSpec, safe_tool_name
 
 if TYPE_CHECKING:
@@ -64,6 +79,104 @@ def load_mcp_config(path: Path) -> dict[str, dict[str, Any]]:
     raw = json.loads(path.read_text() or "{}")
     servers = raw.get("mcpServers", raw.get("servers", {}))
     return {name: expand_env(cfg) for name, cfg in servers.items()}
+
+
+def server_kind(cfg: dict[str, Any]) -> str:
+    kind = (cfg.get("type") or cfg.get("transport") or ("stdio" if "command" in cfg else "http")).lower()
+    return "http" if kind in ("streamable-http", "streamable_http", "http") else kind
+
+
+async def helper_headers(cfg: dict[str, Any]) -> dict[str, str]:
+    """Run `headersHelper` (a shell command that prints a JSON object of headers)."""
+    cmd = cfg.get("headersHelper")
+    if not cmd:
+        return {}
+    proc = await asyncio.create_subprocess_shell(
+        cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), 20)
+    except TimeoutError as e:
+        proc.kill()
+        raise RuntimeError("headersHelper took longer than 20 seconds") from e
+    if proc.returncode != 0:
+        raise RuntimeError(f"headersHelper failed: {err.decode(errors='replace').strip()[:300]}")
+    data = json.loads(out or b"{}")
+    if not isinstance(data, dict):
+        raise RuntimeError("headersHelper must print a JSON object")
+    return {str(k): str(v) for k, v in data.items()}
+
+
+async def open_transport(
+    stack: AsyncExitStack, cfg: dict[str, Any], *, auth: Any = None, errlog: TextIO | None = None
+) -> Any:
+    kind = server_kind(cfg)
+    if kind == "stdio":
+        from mcp.client.stdio import stdio_client
+
+        params = StdioServerParameters(
+            command=cfg["command"],
+            args=[str(a) for a in cfg.get("args", [])],
+            env={
+                **{"PATH": os.environ.get("PATH", "")},
+                **{k: str(v) for k, v in cfg.get("env", {}).items()},
+            },
+            cwd=cfg.get("cwd"),
+        )
+        return stdio_client(params, errlog=errlog) if errlog else stdio_client(params)
+    headers = {**(cfg.get("headers") or {}), **(await helper_headers(cfg))}
+    if kind == "http":
+        from mcp.client.streamable_http import streamable_http_client
+        from mcp.shared._httpx_utils import create_mcp_http_client
+
+        http = await stack.enter_async_context(create_mcp_http_client(headers=headers or None, auth=auth))
+        return streamable_http_client(cfg["url"], http_client=http)
+    if kind == "sse":
+        from mcp.client.sse import sse_client
+
+        return sse_client(cfg["url"], headers=headers or None, auth=auth)
+    raise ValueError(f"Unsupported MCP server type {kind!r} (use stdio, http or sse)")
+
+
+async def sign_in(
+    name: str, cfg: dict[str, Any], data_dir: Path, open_browser: OpenBrowser, timeout: float = 300
+) -> int:
+    """Browser sign-in for one server. Returns how many tools it offers once connected."""
+    if server_kind(cfg) not in ("http", "sse"):
+        raise ValueError(f"{name} is a {server_kind(cfg)} server; only http/sse servers sign in")
+    if not uses_oauth(cfg):
+        raise ValueError(f"{name} has an Authorization header in mcp.json, so it doesn't use sign-in")
+    callback = CallbackServer(oauth_settings(cfg).callback_port)
+    await callback.start()
+    try:
+        provider = interactive_provider(
+            name=name,
+            url=cfg["url"],
+            cfg=cfg,
+            data_dir=data_dir,
+            callback=callback,
+            open_browser=open_browser,
+            timeout=timeout,
+        )
+        try:
+            async with AsyncExitStack() as stack:
+                transport = await open_transport(stack, cfg, auth=provider)
+                client = await stack.enter_async_context(Client(transport, read_timeout_seconds=60))
+                listing = await client.list_tools()
+                return len(listing.tools)
+        except BaseExceptionGroup as group:
+            raise root_error(group) from group
+    finally:
+        await callback.close()
+
+
+def root_error(exc: BaseException) -> BaseException:
+    """The first real error inside (possibly nested) exception groups."""
+    if isinstance(exc, BaseExceptionGroup):
+        inner = [root_error(e) for e in exc.exceptions]
+        real = [e for e in inner if not isinstance(e, asyncio.CancelledError | KeyboardInterrupt)]
+        return (real or inner or [exc])[0]
+    return exc
 
 
 def format_tool_result(result: Any, max_chars: int) -> str:
@@ -127,39 +240,18 @@ class MCPServer:
 
     async def _transport(self, stack: AsyncExitStack) -> Any:
         cfg = self.cfg
-        kind = (cfg.get("type") or cfg.get("transport") or ("stdio" if "command" in cfg else "http")).lower()
-        if cfg.get("oauth") or cfg.get("auth"):
-            raise ValueError(
-                "OAuth sign-in isn't supported here; see README ('Servers that need a browser sign-in')"
-            )
-        if kind == "stdio":
+        if server_kind(cfg) == "stdio":
             logs = self.manager.app.cfg.data_dir / "logs"
             logs.mkdir(parents=True, exist_ok=True)
             if self._errlog is None:
                 self._errlog = open(logs / f"mcp-{self.name}.log", "a", buffering=1)  # noqa: SIM115, ASYNC230
-            params = StdioServerParameters(
-                command=cfg["command"],
-                args=[str(a) for a in cfg.get("args", [])],
-                env={
-                    **{"PATH": os.environ.get("PATH", "")},
-                    **{k: str(v) for k, v in cfg.get("env", {}).items()},
-                },
-                cwd=cfg.get("cwd"),
+            return await open_transport(stack, cfg, errlog=self._errlog)
+        auth = None
+        if uses_oauth(cfg):
+            auth = background_provider(
+                name=self.name, url=cfg["url"], cfg=cfg, data_dir=self.manager.app.cfg.data_dir
             )
-            from mcp.client.stdio import stdio_client
-
-            return stdio_client(params, errlog=self._errlog)
-        if kind in ("http", "streamable-http", "streamable_http"):
-            from mcp.client.streamable_http import streamable_http_client
-            from mcp.shared._httpx_utils import create_mcp_http_client
-
-            http = await stack.enter_async_context(create_mcp_http_client(headers=cfg.get("headers") or None))
-            return streamable_http_client(cfg["url"], http_client=http)
-        if kind == "sse":
-            from mcp.client.sse import sse_client
-
-            return sse_client(cfg["url"], headers=cfg.get("headers") or None)
-        raise ValueError(f"Unknown MCP server type {kind!r}")
+        return await open_transport(stack, cfg, auth=auth)
 
     async def _supervise(self) -> None:
         backoff = RECONNECT_FIRST
@@ -183,12 +275,18 @@ class MCPServer:
             except asyncio.CancelledError:
                 raise
             except BaseException as e:  # noqa: BLE001 - anyio may raise ExceptionGroup
-                self.error = _describe(e)
-                self.status = "error"
+                needs_login = find_exception(e, LoginRequired) is not None
+                if needs_login:
+                    self.status = "needs_login"
+                    self.error = (
+                        f"Not signed in. Run `pa mcp login {self.name}` or use Sign in on the web page."
+                    )
+                else:
+                    self.status, self.error = "error", _describe(e)
                 log.warning("MCP server %s: %s", self.name, self.error)
                 self.manager.app.bus.emit(
                     "mcp_status",
-                    {"server": self.name, "status": "error", "error": self.error},
+                    {"server": self.name, "status": self.status, "error": self.error},
                     source="system",
                 )
             finally:
@@ -196,6 +294,9 @@ class MCPServer:
                 self.manager.app.tools.unregister_origin(self.origin)
                 self.ready.set()  # don't block startup on a broken server
             if self._stop.is_set():
+                break
+            if self.status == "needs_login":
+                await self._stop.wait()  # signing in restarts this server
                 break
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 300.0)
@@ -279,6 +380,7 @@ class MCPManager:
     def __init__(self, app: AgentApp):
         self.app = app
         self.servers: dict[str, MCPServer] = {}
+        self._logins: dict[str, asyncio.Task[int]] = {}
 
     @property
     def config_path(self) -> Path:
@@ -300,6 +402,8 @@ class MCPManager:
                 log.warning("Some MCP servers are still starting; continuing without waiting")
 
     async def stop(self) -> None:
+        for t in self._logins.values():
+            t.cancel()
         await asyncio.gather(*(s.stop() for s in self.servers.values()), return_exceptions=True)
         self.servers.clear()
 
@@ -307,8 +411,78 @@ class MCPManager:
         await self.stop()
         await self.start()
 
+    async def restart(self, name: str, wait: float = 20.0) -> None:
+        """Re-read mcp.json and reconnect one server (e.g. after signing in)."""
+        old = self.servers.pop(name, None)
+        if old:
+            await old.stop()
+        cfg = load_mcp_config(self.config_path).get(name)
+        if not cfg or cfg.get("disabled"):
+            return
+        server = MCPServer(self, name, cfg)
+        self.servers[name] = server
+        server.start()
+        try:
+            await asyncio.wait_for(server.ready.wait(), timeout=wait)
+        except TimeoutError:
+            pass
+
+    async def start_login(self, name: str) -> dict[str, Any]:
+        """Start a sign-in from the web page: returns the URL for the browser to open."""
+        cfg = load_mcp_config(self.config_path).get(name)
+        if cfg is None:
+            raise KeyError(f"No MCP server named {name!r} in mcp.json")
+        previous = self._logins.pop(name, None)
+        if previous and not previous.done():
+            previous.cancel()
+            await asyncio.gather(previous, return_exceptions=True)
+        url_ready: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+
+        def hand_over(url: str) -> None:
+            if not url_ready.done():
+                url_ready.set_result(url)
+
+        async def run() -> int:
+            count = await sign_in(name, cfg, self.app.cfg.data_dir, hand_over)
+            self.app.bus.emit("mcp_status", {"server": name, "status": "signed_in"}, source="system")
+            await self.restart(name)
+            return count
+
+        task = asyncio.create_task(run(), name=f"login:{name}")
+        self._logins[name] = task
+
+        def report(t: asyncio.Task[int]) -> None:
+            if not t.cancelled() and t.exception() is not None:
+                self.app.bus.emit(
+                    "error",
+                    {"text": f"Sign-in to {name} failed: {_describe(t.exception())}"},
+                    source="system",
+                )
+
+        task.add_done_callback(report)
+        done, _ = await asyncio.wait({url_ready, task}, timeout=30, return_when=asyncio.FIRST_COMPLETED)
+        if url_ready in done:
+            return {"url": url_ready.result()}
+        if task in done:
+            return {"done": True, "tools": task.result()}
+        raise TimeoutError("The server didn't start a sign-in within 30 seconds")
+
     def status(self) -> list[dict[str, Any]]:
-        return [
-            {"name": s.name, "status": s.status, "error": s.error, "tools": len(s.tool_names)}
-            for s in self.servers.values()
-        ]
+        out = []
+        for s in self.servers.values():
+            oauth = uses_oauth(s.cfg)
+            out.append(
+                {
+                    "name": s.name,
+                    "status": s.status,
+                    "error": s.error,
+                    "tools": len(s.tool_names),
+                    "auth": "oauth" if oauth else ("headers" if s.cfg.get("headers") else None),
+                    "signed_in": FileTokenStorage(token_path(self.app.cfg.data_dir, s.name)).summary()[
+                        "signed_in"
+                    ]
+                    if oauth
+                    else None,
+                }
+            )
+        return out

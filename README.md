@@ -165,29 +165,76 @@ on the `[notify] default_escalation` schedule (a desktop alert after 20 min, an 
 
 ## MCP servers
 
-`mcp.json` uses the same shape as Claude Desktop and Claude Code, so you can paste existing
-entries in:
+### Bring over what you use in Claude Code
+
+```bash
+pa mcp import            # reads ~/.claude.json: user-scoped and local-scoped servers
+pa mcp import --dry-run  # just show what it would add
+pa mcp import --project ~/some/repo   # also that folder's .mcp.json
+```
+
+This copies the server definitions into `mcp.json` and keeps any entry you already have
+there (`--overwrite` replaces them). Logins don't carry over: Claude Code's tokens live in its
+keychain entries and were issued to its own app. So the import lists the servers to sign in to.
+
+### Sign in
+
+```bash
+pa mcp login atlassian   # opens your browser, like /mcp in Claude Code
+pa mcp list              # every server, whether you're signed in, and what the agent sees
+pa mcp logout atlassian
+```
+
+You can also click **Sign in** next to a server in the web page's System tab. Tokens are saved
+in `~/.personal_agentic/oauth/<server>.json`, readable only by you, and refreshed automatically.
+The agent never opens a browser by itself. If a server needs a fresh sign-in, it shows as
+"needs sign-in" and the web page tells you.
+
+Any `http` or `sse` server without an `Authorization` header uses sign-in.
+
+- **Servers that register apps on their own** (Atlassian; Glean in most setups) need nothing
+  more than the URL.
+- **Servers that don't** (Slack; Google's Workspace servers) need an app you register with
+  them. Give its client ID and, if it has one, its secret:
 
 ```json
-{
-  "mcpServers": {
-    "slack":  {"command": "npx", "args": ["-y", "some-slack-mcp"], "env": {"SLACK_BOT_TOKEN": "${SLACK_BOT_TOKEN}"}},
-    "github": {"command": "github-mcp-server", "args": ["stdio"], "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"}},
-    "company": {"type": "http", "url": "https://mcp.example.internal/mcp", "headers": {"Authorization": "Bearer ${COMPANY_TOKEN}"}}
+"slack": {
+  "type": "http",
+  "url": "https://mcp.slack.com/mcp",
+  "oauth": {
+    "clientId": "${SLACK_CLIENT_ID}",
+    "clientSecret": "${SLACK_CLIENT_SECRET}",
+    "callbackPort": 33418,
+    "scopes": "search:read.public channels:history"
   }
 }
 ```
 
+  The app's allowed redirect URL has to be `http://localhost:33418/callback`, or the
+  `callbackPort` you choose.
+
+### Your services
+
+| Service | How to connect |
+|---|---|
+| Atlassian | Sign in. Or, if your admin allows API tokens: `"url": "https://mcp.atlassian.com/v2/mcp"` with `"headers": {"Authorization": "Basic ${ATLASSIAN_BASIC}"}` (base64 of `email:token`). Code search and Teams tools need sign-in. |
+| Glean | Sign in, with the server URL from Glean's MCP Configurator (it's specific to your company). |
+| Slack | Needs an internal Slack app in your workspace (Slack only allows directory-listed or internal apps, and admins approve them). Then sign in with its client ID and secret, or put a user token from that app in an `Authorization: Bearer` header. |
+| Google | Claude's built-in Gmail/Calendar/Drive connectors run through Anthropic, so the agent can't use them. Google's own Workspace MCP servers (e.g. `https://gmailmcp.googleapis.com/mcp/v1`) are a developer preview: you need to be enrolled, create an OAuth client in a Google Cloud project with the `http://localhost:33418/callback` redirect, and enable the APIs. Then sign in with that client ID and secret. |
+
+### Everything else
+
+- Local servers run as commands: `{"command": "npx", "args": ["-y", "some-mcp"], "env": {"TOKEN": "${TOKEN}"}}`.
 - `${NAME}` values come from `.env` (git-ignored).
 - Tools show up as `<server>__<tool>`. `pa tools` lists them.
-- Each server can also set `include_tools`, `exclude_tools`, `policy`, `timeout` and `disabled`.
+- Each server can also set:
+  - `include_tools` and `exclude_tools`
+  - `policy`
+  - `timeout` (in seconds)
+  - `headersHelper`, a command that prints JSON headers
+  - `disabled`
 - Server logs go to `~/.personal_agentic/logs/mcp-<name>.log`.
-- Restart servers after editing mcp.json with the button in the web page's System tab.
-
-**Servers that need a browser sign-in (OAuth)** aren't handled by the agent itself, as you
-asked. When you get to those, the usual route is a stdio bridge such as `mcp-remote`. It does
-the browser sign-in once and caches the token, and the agent just sees a normal command:
-`{"command": "npx", "args": ["-y", "mcp-remote", "https://mcp.example.com/mcp"]}`.
+- After editing mcp.json, restart the servers from the System tab.
 
 ## Your own tools
 
@@ -230,6 +277,8 @@ src/personal_agentic/
   agent/              tool-calling loop, sessions, compaction
   llm/                LM Studio chat (streaming, tools, reasoning), embeddings, priority gate
   mcp_servers.py      MCP connections (stdio, HTTP, SSE)
+  oauth.py            browser sign-in for MCP servers, saved tokens
+  mcp_import.py       pa mcp import (from Claude Code)
   tools/              registry and approval policy, built-in tools, @tool loader
   routines/           Markdown/Python loader, schedules, runner, ctx for Python routines
   attention.py        approvals, reviews, escalation

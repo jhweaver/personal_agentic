@@ -76,3 +76,47 @@ async def agent(cfg):
     await a.start(scheduler=False, mcp=False)
     yield a
     await a.stop()
+
+
+def _serve_in_thread(app):
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    server = _Server(uvicorn.Config(app, log_level="warning", lifespan="on"))
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
+    thread.start()
+    for _ in range(200):
+        if server.started:
+            break
+        time.sleep(0.05)
+    return port, server, thread
+
+
+@pytest.fixture(scope="session")
+def _oauth_server_session():
+    from fake_oauth_server import make_app as make_oauth_app
+
+    app, state = make_oauth_app()
+    port, server, thread = _serve_in_thread(app)
+    state.base = f"http://127.0.0.1:{port}"
+    yield {"url": f"http://127.0.0.1:{port}/mcp", "state": state}
+    server.should_exit = True
+    thread.join(timeout=5)
+
+
+@pytest.fixture
+def oauth_server(_oauth_server_session):
+    st = _oauth_server_session["state"]
+    st.dcr, st.expires_in, st.refresh_count = True, 3600, 0
+    st.token_requests.clear()
+    st.authorize_requests.clear()
+    return _oauth_server_session
+
+
+@pytest.fixture
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port

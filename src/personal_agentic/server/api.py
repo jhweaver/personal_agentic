@@ -196,6 +196,35 @@ def create_app(
         await A().mcp.reload()
         return A().mcp.status()
 
+    @api.get("/api/mcp")
+    async def mcp_status() -> list[dict[str, Any]]:
+        return A().mcp.status()
+
+    @api.post("/api/mcp/{name}/restart")
+    async def restart_mcp(name: str) -> list[dict[str, Any]]:
+        await A().mcp.restart(name)
+        return A().mcp.status()
+
+    @api.post("/api/mcp/{name}/login")
+    async def login_mcp(name: str) -> dict[str, Any]:
+        try:
+            return await A().mcp.start_login(name)
+        except KeyError as e:
+            raise HTTPException(404, str(e)) from e
+        except Exception as e:
+            raise HTTPException(400, f"Sign-in couldn't start: {e}") from e
+
+    @api.post("/api/mcp/{name}/logout")
+    async def logout_mcp(name: str) -> dict[str, Any]:
+        from ..mcp_servers import load_mcp_config
+        from ..oauth import FileTokenStorage, token_path
+
+        if name not in load_mcp_config(A().mcp.config_path):
+            raise HTTPException(404, f"No MCP server named {name!r}")
+        removed = FileTokenStorage(token_path(cfg.data_dir, name)).clear()
+        await A().mcp.restart(name)
+        return {"signed_out": removed}
+
     @api.get("/api/tools")
     async def tools() -> list[dict[str, Any]]:
         return [
